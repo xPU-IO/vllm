@@ -1308,8 +1308,9 @@ def runai_safetensors_weights_iterator(
 # ---------------------------------------------------------------------------
 
 
-def _phx_make_view(buf: torch.Tensor, offset: int, nbytes: int,
-                   dtype: torch.dtype, shape: torch.Size) -> torch.Tensor:
+def _phx_make_view(
+    buf: torch.Tensor, offset: int, nbytes: int, dtype: torch.dtype, shape: torch.Size
+) -> torch.Tensor:
     """Create a typed view of ``buf[offset:offset+nbytes]``.
 
     When *offset* is not aligned to ``dtype.itemsize`` (e.g. a BFloat16
@@ -1319,10 +1320,10 @@ def _phx_make_view(buf: torch.Tensor, offset: int, nbytes: int,
     correct, contiguous tensor of the requested dtype/shape.
     """
     if offset % dtype.itemsize == 0:
-        return buf[offset:offset + nbytes].view(dtype).reshape(shape)
+        return buf[offset : offset + nbytes].view(dtype).reshape(shape)
     # Unaligned offset: copy into a fresh aligned buffer.
     tmp = torch.empty(nbytes, dtype=torch.uint8, device=buf.device)
-    tmp.copy_(buf[offset:offset + nbytes])
+    tmp.copy_(buf[offset : offset + nbytes])
     return tmp.view(dtype).reshape(shape)
 
 
@@ -1342,8 +1343,7 @@ def phoenix_weights_iterator(
     loader = PhxLoader(current_platform.current_device())
 
     sorted_files = sorted(hf_weights_files, key=_natural_sort_key)
-    rank = (torch.distributed.get_rank()
-            if torch.distributed.is_initialized() else 0)
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
 
     # 64K alignment required by phxfs_regmem
     GPU_PAGE_SIZE = 64 * 1024
@@ -1411,13 +1411,14 @@ def phoenix_weights_iterator(
                 if end > start:
                     entries.append((plan.slots[i], start, end - start))
             batches.append(entries)
-            if file_size > aligned_end:
+            group = plan.groups[-1]
+            tail_start = max(aligned_end, group.aligned_f_offset)
+            tail_end = min(file_size, group.aligned_f_offset + group.read_size)
+            if tail_end > tail_start:
                 with open(plan.path, "rb") as f:
-                    f.seek(aligned_end)
-                    tail = f.read(file_size - aligned_end)
-                group = plan.groups[-1]
-                buf_off = (plan.slots[-1] + group.pre_padding
-                           + (aligned_end - group.first_tensor_f_offset))
+                    f.seek(tail_start)
+                    tail = f.read(tail_end - tail_start)
+                buf_off = plan.slots[-1] + tail_start - group.aligned_f_offset
                 tails.append((buf_off, tail))
             else:
                 tails.append(None)
@@ -1440,14 +1441,17 @@ def phoenix_weights_iterator(
             first_batch = batches[0]
             t_submit = time.perf_counter()
             loader.load_tensors_into_buffer_async(
-                first_plan.path, buffers[buf_idx].data_ptr(), first_batch)
+                first_plan.path, buffers[buf_idx].data_ptr(), first_batch
+            )
             t_submit_total += time.perf_counter() - t_submit
 
             for vi, (_, plan) in enumerate(
-                tqdm(valid_plans,
-                     desc="Loading safetensors using Phoenix loader",
-                     disable=not enable_tqdm(use_tqdm_on_load),
-                     bar_format=_BAR_FORMAT)
+                tqdm(
+                    valid_plans,
+                    desc="Loading safetensors using Phoenix loader",
+                    disable=not enable_tqdm(use_tqdm_on_load),
+                    bar_format=_BAR_FORMAT,
+                )
             ):
                 file_count += 1
                 buf_curr = buffers[buf_idx]
@@ -1463,8 +1467,9 @@ def phoenix_weights_iterator(
                 tail_entry = tails[vi]
                 if tail_entry is not None:
                     buf_off, tail = tail_entry
-                    buf_curr[buf_off:buf_off + len(tail)].copy_(
-                        torch.frombuffer(bytearray(tail), dtype=torch.uint8))
+                    buf_curr[buf_off : buf_off + len(tail)].copy_(
+                        torch.frombuffer(bytearray(tail), dtype=torch.uint8)
+                    )
 
                 # Submit next file's DMA → buf_next (if not last)
                 if vi < n_valid - 1:
@@ -1477,7 +1482,8 @@ def phoenix_weights_iterator(
                     # Submit async DMA (returns immediately)
                     t_submit = time.perf_counter()
                     loader.load_tensors_into_buffer_async(
-                        next_plan.path, buf_next.data_ptr(), next_batch)
+                        next_plan.path, buf_next.data_ptr(), next_batch
+                    )
                     t_submit_total += time.perf_counter() - t_submit
 
                 # Yield views from current buffer.
@@ -1486,17 +1492,21 @@ def phoenix_weights_iterator(
                 t_yield_start = time.perf_counter()
                 for i, group in enumerate(plan.groups):
                     slot = plan.slots[i]
-                    for name, (dtype, shape, data_start, nbytes) in (
-                        group.tensors.items()
-                    ):
+                    for name, (
+                        dtype,
+                        shape,
+                        data_start,
+                        nbytes,
+                    ) in group.tensors.items():
                         tensor_f_offset = plan.header_size + data_start
                         view_offset = (
-                            slot + group.pre_padding
-                            + (tensor_f_offset
-                               - group.first_tensor_f_offset)
+                            slot
+                            + group.pre_padding
+                            + (tensor_f_offset - group.first_tensor_f_offset)
                         )
                         view = _phx_make_view(
-                            buf_curr, view_offset, nbytes, dtype, shape)
+                            buf_curr, view_offset, nbytes, dtype, shape
+                        )
                         yield name, view
                 t_yield_total += time.perf_counter() - t_yield_start
 
@@ -1521,10 +1531,18 @@ def phoenix_weights_iterator(
                 "wait_dma=%.3fs PURE_DMA=%.3fs "
                 "deregmem=%.3fs total=%.3fs buf_size=%.1fMB "
                 "overlap_hidden=%.3fs",
-                rank, file_count, t_prescan, t_regmem,
-                t_sync_total, t_submit_total, t_yield_total,
-                t_wait_total, pure_dma,
-                t_deregmem, t_total, buf_size / 1024 / 1024,
+                rank,
+                file_count,
+                t_prescan,
+                t_regmem,
+                t_sync_total,
+                t_submit_total,
+                t_yield_total,
+                t_wait_total,
+                pure_dma,
+                t_deregmem,
+                t_total,
+                buf_size / 1024 / 1024,
                 overlap_hidden,
             )
     finally:

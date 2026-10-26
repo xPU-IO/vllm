@@ -374,3 +374,117 @@ class TestEpFilterOnSyntheticMoeWeights:
 
         for name, tensor in filtered.items():
             assert torch.equal(tensor, all_weights[name]), f"Tensor mismatch for {name}"
+
+
+class TestPhoenixEpTail:
+    @pytest.mark.parametrize(
+        "layout", ["filtered_eof", "needed_eof", "partial_tail", "all_filtered"]
+    )
+    def test_filtered_tail(self, tmp_path, monkeypatch, layout):
+        import ctypes
+        import json
+        import struct
+
+        from phxloader import (
+            build_file_plan,
+            build_read_groups,
+            parse_safetensor_header,
+        )
+
+        from vllm.model_executor.model_loader import weight_utils
+
+        local = "model.layers.0.mlp.experts.0.gate_proj.weight"
+        remote = "model.layers.0.mlp.experts.1.gate_proj.weight"
+        data = {
+            local: torch.arange(8195, dtype=torch.int64).to(torch.uint8),
+            remote: torch.arange(262144, dtype=torch.int64).to(torch.uint8),
+        }
+        order = [remote, local] if layout == "needed_eof" else [local, remote]
+        header = {}
+        chunks = []
+        offset = 0
+        for name in order:
+            raw = data[name].numpy().tobytes()
+            header[name] = {
+                "dtype": "U8",
+                "shape": [len(raw)],
+                "data_offsets": [offset, offset + len(raw)],
+            }
+            offset += len(raw)
+            chunks.append(raw)
+        encoded = json.dumps(header).encode()
+        encoded += b" " * (-len(encoded) % 8)
+        if layout == "partial_tail":
+            encoded += b" " * ((-8 - len(encoded) - data[local].numel() + 100) % 4096)
+        path = tmp_path / "model-00001-of-00002.safetensors"
+        path.write_bytes(struct.pack("<Q", len(encoded)) + encoded + b"".join(chunks))
+        skipped = tmp_path / "model-00002-of-00002.safetensors"
+        skipped_header = json.dumps(
+            {remote: {"dtype": "U8", "shape": [1], "data_offsets": [0, 1]}}
+        ).encode()
+        skipped.write_bytes(
+            struct.pack("<Q", len(skipped_header)) + skipped_header + b"\x01"
+        )
+        closed = []
+        registered = set()
+
+        class Loader:
+            def __init__(self, device):
+                self.pending = None
+
+            def regmem(self, ptr, size):
+                registered.add(ptr)
+
+            def deregmem(self, ptr, size):
+                registered.remove(ptr)
+
+            def load_tensors_into_buffer_async(self, filename, ptr, entries):
+                assert self.pending is None
+                self.pending = filename, ptr, entries
+
+            def wait_dma(self):
+                filename, ptr, entries = self.pending
+                with open(filename, "rb") as f:
+                    for buf_offset, file_offset, nbytes in entries:
+                        f.seek(file_offset)
+                        raw = f.read(nbytes)
+                        assert len(raw) == nbytes
+                        ctypes.memmove(ptr + buf_offset, raw, nbytes)
+                self.pending = None
+
+            def reset_dma_timer(self):
+                pass
+
+            def get_dma_seconds(self):
+                return 0.0
+
+            def close(self):
+                closed.append(True)
+
+        empty = torch.empty
+
+        def cpu_empty(*args, **kwargs):
+            kwargs["device"] = "cpu"
+            return empty(*args, **kwargs)
+
+        monkeypatch.setattr(weight_utils, "PhxLoader", Loader)
+        monkeypatch.setattr(
+            weight_utils, "parse_safetensor_header", parse_safetensor_header
+        )
+        monkeypatch.setattr(weight_utils, "build_read_groups", build_read_groups)
+        monkeypatch.setattr(weight_utils, "build_file_plan", build_file_plan)
+        monkeypatch.setattr(weight_utils.current_platform, "current_device", lambda: 0)
+        monkeypatch.setattr(torch, "empty", cpu_empty)
+        monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+        local_ids = {2} if layout == "all_filtered" else {0}
+        loaded = {
+            name: value.clone()
+            for name, value in weight_utils.phoenix_weights_iterator(
+                [str(path), str(skipped)], False, local_expert_ids=local_ids
+            )
+        }
+        assert set(loaded) == (set() if layout == "all_filtered" else {local})
+        if loaded:
+            assert torch.equal(loaded[local], data[local])
+        assert not registered
+        assert closed == [True]
